@@ -215,6 +215,8 @@ class Train(object):
                 start = time.time()
             if iter % 2500 == 0:
                 self.save_model(running_avg_loss, iter)
+            if loss < 2.0:
+              self.save_best_so_far(running_avg_loss, iter)
 #            if is_new_best and iter > 200:
 #                print('BEST steps %d, seconds for %d batch: %.2f , loss: %f' % (iter, print_interval,
 #                                                                           time.time() - start, best_loss))
