@@ -47,8 +47,8 @@ class Encoder(nn.Module):
 
         self.lstm = nn.LSTM(config.emb_dim, config.hidden_dim, num_layers=1, batch_first=True, bidirectional=True)
         init_lstm_wt(self.lstm)
-
-        self.W_h = nn.Linear(config.hidden_dim * 2, config.hidden_dim * 2, bias=False)
+        if not (config.scratchpad or config.pretrain):
+          self.W_h = nn.Linear(config.hidden_dim * 2, config.hidden_dim * 2, bias=False)
 
     #seq_lens should be in descending order
     def forward(self, input, seq_lens):
@@ -61,7 +61,8 @@ class Encoder(nn.Module):
         encoder_outputs = encoder_outputs.contiguous()
 
         encoder_feature = encoder_outputs.view(-1, 2*config.hidden_dim)  # B * t_k x 2*hidden_dim
-        encoder_feature = self.W_h(encoder_feature)
+        if not (config.scratchpad or config.pretrain):
+          encoder_feature = self.W_h(encoder_feature)
 
         return encoder_outputs, encoder_feature, hidden
 
@@ -77,11 +78,65 @@ class ReduceState(nn.Module):
     def forward(self, hidden):
         h, c = hidden # h, c dim = 2 x b x hidden_dim
         h_in = h.transpose(0, 1).contiguous().view(-1, config.hidden_dim * 2)
-        hidden_reduced_h = F.relu(self.reduce_h(h_in))
+        hidden_reduced_h = F.tanh(self.reduce_h(h_in))
         c_in = c.transpose(0, 1).contiguous().view(-1, config.hidden_dim * 2)
-        hidden_reduced_c = F.relu(self.reduce_c(c_in))
+        hidden_reduced_c = F.tanh(self.reduce_c(c_in))
 
         return (hidden_reduced_h.unsqueeze(0), hidden_reduced_c.unsqueeze(0)) # h, c dim = 1 x b x hidden_dim
+
+class AttentiveWriter(nn.Module):
+    def __init__(self):
+        super(AttentiveWriter, self).__init__()
+        # attention
+        self.decode_proj = nn.Sequential(
+          nn.Linear(config.hidden_dim * 4, config.hidden_dim * 2),
+        )
+        self.v = nn.Sequential(
+          nn.Tanh(),
+          nn.Linear(config.hidden_dim * 2, 1, bias=False),
+        )
+        self.W_h_s = nn.Sequential(
+          nn.Linear(config.hidden_dim * 2, config.hidden_dim * 2, bias=False),
+        )
+        self.to_write = nn.Sequential(
+          nn.Linear(config.hidden_dim * 4, config.hidden_dim * 2),
+          nn.LeakyReLU(),
+          nn.Linear(config.hidden_dim * 2, config.hidden_dim * 2),
+          nn.Tanh(),
+        )
+
+    def forward(self, s_t_hat, encoder_outputs, encoder_feature, enc_padding_mask):
+        b, t_k, n = list(encoder_outputs.size())
+
+        dec_fea = self.decode_proj(s_t_hat) # B x 2*hidden_dim
+        dec_fea_expanded = dec_fea.unsqueeze(1).expand(b, t_k, n).contiguous() # B x t_k x 2*hidden_dim
+        dec_fea_expanded = dec_fea_expanded.view(-1, n)  # B * t_k x 2*hidden_dim
+
+        att_features = self.W_h_s(encoder_outputs).view(b * t_k, n) \
+                       + dec_fea_expanded # B * t_k x 2*hidden_dim
+
+#        e = F.tanh(att_features) # B * t_k x 2*hidden_dim
+        scores = self.v(att_features)  # B * t_k x 1
+        scores = scores.view(-1, t_k)  # B x t_k
+
+        if config.write_attn_fn == 'sigmoid':
+            attn_dist = (F.sigmoid(scores)) * enc_padding_mask # B x t_k
+        elif config.write_attn_fn == 'tanh':
+            attn_dist = (0.5 * (F.tanh(scores) + 1)) * enc_padding_mask
+        else:
+          raise ValueError("config.write_attn_fn must be in ['sigmoid', 'tanh']")
+
+        attn_dist = attn_dist.unsqueeze(1)  # B x 1 x t_k
+
+        attn_dist = attn_dist.view(-1, t_k)  # B x t_k
+
+        write_attn = attn_dist.unsqueeze(2)
+
+        update = self.to_write(s_t_hat).unsqueeze(1) #B x 2 * hidden_dim
+        out = (write_attn * update) + ((1 - write_attn) * encoder_outputs)
+#        out = (write_attn * update).view(-1, n) + ((1 - write_attn).view(-1, 1) * encoder_feature)
+
+        return attn_dist, out
 
 class Attention(nn.Module):
     def __init__(self):
@@ -89,8 +144,24 @@ class Attention(nn.Module):
         # attention
         if config.is_coverage:
             self.W_c = nn.Linear(1, config.hidden_dim * 2, bias=False)
-        self.decode_proj = nn.Linear(config.hidden_dim * 2, config.hidden_dim * 2)
-        self.v = nn.Linear(config.hidden_dim * 2, 1, bias=False)
+        if config.scratchpad or config.pretrain:
+            self.W_h_s = nn.Sequential(
+                nn.Linear(config.hidden_dim * 2, config.hidden_dim * 2, bias=False),
+#                nn.LeakyReLU()
+#                nn.Tanh(),
+#                nn.ReLU(inplace=True)
+            )
+
+        self.decode_proj = nn.Sequential(
+          nn.Linear(config.hidden_dim * 2, config.hidden_dim * 2, bias=False),
+#          nn.LeakyReLU(),
+#          nn.Tanh(),
+#          nn.ReLU(inplace=True),
+        )
+        self.v = nn.Sequential(
+          nn.Tanh(),
+          nn.Linear(config.hidden_dim * 2, 1, bias=False),
+        )
 
     def forward(self, s_t_hat, encoder_outputs, encoder_feature, enc_padding_mask, coverage):
         b, t_k, n = list(encoder_outputs.size())
@@ -99,14 +170,18 @@ class Attention(nn.Module):
         dec_fea_expanded = dec_fea.unsqueeze(1).expand(b, t_k, n).contiguous() # B x t_k x 2*hidden_dim
         dec_fea_expanded = dec_fea_expanded.view(-1, n)  # B * t_k x 2*hidden_dim
 
-        att_features = encoder_feature + dec_fea_expanded # B * t_k x 2*hidden_dim
+        if config.scratchpad or config.pretrain:
+          att_features = self.W_h_s(encoder_outputs).view(b * t_k, n) + dec_fea_expanded
+        else:
+          att_features = encoder_feature + dec_fea_expanded # B * t_k x 2*hidden_dim
+
         if config.is_coverage:
             coverage_input = coverage.view(-1, 1)  # B * t_k x 1
             coverage_feature = self.W_c(coverage_input)  # B * t_k x 2*hidden_dim
             att_features = att_features + coverage_feature
 
-        e = F.tanh(att_features) # B * t_k x 2*hidden_dim
-        scores = self.v(e)  # B * t_k x 1
+#        e = F.tanh(att_features) # B * t_k x 2*hidden_dim
+        scores = self.v(att_features)  # B * t_k x 1
         scores = scores.view(-1, t_k)  # B x t_k
 
         attn_dist_ = F.softmax(scores, dim=1)*enc_padding_mask # B x t_k
@@ -114,7 +189,10 @@ class Attention(nn.Module):
         attn_dist = attn_dist_ / normalization_factor
 
         attn_dist = attn_dist.unsqueeze(1)  # B x 1 x t_k
-        c_t = torch.bmm(attn_dist, encoder_outputs)  # B x 1 x n
+        if config.scratchpad or config.pretrain:
+          c_t = torch.bmm(attn_dist, encoder_outputs)
+        else:
+          c_t = torch.bmm(attn_dist, encoder_outputs)  # B x 1 x n
         c_t = c_t.view(-1, config.hidden_dim * 2)  # B x 2*hidden_dim
 
         attn_dist = attn_dist.view(-1, t_k)  # B x t_k
@@ -147,7 +225,7 @@ class Decoder(nn.Module):
         init_linear_wt(self.out2)
 
     def forward(self, y_t_1, s_t_1, encoder_outputs, encoder_feature, enc_padding_mask,
-                c_t_1, extra_zeros, enc_batch_extend_vocab, coverage, step):
+               c_t_1, extra_zeros, enc_batch_extend_vocab, coverage, step):
 
         if not self.training and step == 0:
             h_decoder, c_decoder = s_t_1
@@ -156,6 +234,76 @@ class Decoder(nn.Module):
             c_t, _, coverage_next = self.attention_network(s_t_hat, encoder_outputs, encoder_feature,
                                                               enc_padding_mask, coverage)
             coverage = coverage_next
+
+        y_t_1_embd = self.embedding(y_t_1)
+        x = self.x_context(torch.cat((c_t_1, y_t_1_embd), 1))
+        lstm_out, s_t = self.lstm(x.unsqueeze(1), s_t_1)
+
+        h_decoder, c_decoder = s_t
+        s_t_hat = torch.cat((h_decoder.view(-1, config.hidden_dim),
+                             c_decoder.view(-1, config.hidden_dim)), 1)  # B x 2*hidden_dim
+        c_t, attn_dist, coverage_next = self.attention_network(s_t_hat, encoder_outputs, encoder_feature,
+                                                          enc_padding_mask, coverage)
+
+        if self.training or step > 0:
+            coverage = coverage_next
+
+        p_gen = None
+        if config.pointer_gen:
+            p_gen_input = torch.cat((c_t, s_t_hat, x), 1)  # B x (2*2*hidden_dim + emb_dim)
+            p_gen = self.p_gen_linear(p_gen_input)
+            p_gen = F.sigmoid(p_gen)
+
+        output = torch.cat((lstm_out.view(-1, config.hidden_dim), c_t), 1) # B x hidden_dim * 3
+        output = self.out1(output) # B x hidden_dim
+
+        output = F.relu(output)
+
+        output = self.out2(output) # B x vocab_size
+        vocab_dist = F.softmax(output, dim=1)
+
+        if config.pointer_gen:
+            vocab_dist_ = p_gen * vocab_dist
+            attn_dist_ = (1 - p_gen) * attn_dist
+
+            if extra_zeros is not None:
+                vocab_dist_ = torch.cat([vocab_dist_, extra_zeros], 1)
+
+            final_dist = vocab_dist_.scatter_add(1, enc_batch_extend_vocab, attn_dist_)
+        else:
+            final_dist = vocab_dist
+
+        return final_dist, s_t, c_t, attn_dist, p_gen, coverage
+
+class ScratchpadDecoder(nn.Module):
+    def __init__(self):
+        super(ScratchpadDecoder, self).__init__()
+        self.attention_network = Attention()
+        self.attentive_writer = AttentiveWriter()
+        # decoder
+        self.embedding = nn.Embedding(config.vocab_size, config.emb_dim)
+        init_wt_normal(self.embedding.weight)
+
+        self.x_context = nn.Linear(config.hidden_dim * 2 + config.emb_dim, config.emb_dim)
+
+        self.lstm = nn.LSTM(config.emb_dim, config.hidden_dim, num_layers=1, batch_first=True, bidirectional=False)
+        init_lstm_wt(self.lstm)
+
+        if config.pointer_gen:
+            self.p_gen_linear = nn.Linear(config.hidden_dim * 4 + config.emb_dim, 1)
+
+        #p_vocab
+        self.out1 = nn.Linear(config.hidden_dim * 3, config.hidden_dim)
+        self.out2 = nn.Linear(config.hidden_dim, config.vocab_size)
+        init_linear_wt(self.out2)
+
+    def forward(self, y_t_1, s_t_1, encoder_outputs, encoder_feature, enc_padding_mask,
+                c_t_1, extra_zeros, enc_batch_extend_vocab, coverage, step):
+
+        if not self.training and step == 0:
+            h_decoder, c_decoder = s_t_1
+            s_t_hat = torch.cat((h_decoder.view(-1, config.hidden_dim),
+                                 c_decoder.view(-1, config.hidden_dim)), 1)  # B x 2*hidden_dim
 
         y_t_1_embd = self.embedding(y_t_1)
         x = self.x_context(torch.cat((c_t_1, y_t_1_embd), 1))
@@ -195,12 +343,24 @@ class Decoder(nn.Module):
         else:
             final_dist = vocab_dist
 
-        return final_dist, s_t, c_t, attn_dist, p_gen, coverage
+        if config.scratchpad:
+          with_context = torch.cat([c_t, s_t_hat], 1)
+          write_attn, encoder_outputs = self.attentive_writer(
+              with_context, encoder_outputs, encoder_feature, enc_padding_mask
+          )
 
-class Model(object):
+        return final_dist, s_t, c_t, attn_dist, p_gen, encoder_outputs
+
+
+class Model(nn.Module):
     def __init__(self, model_file_path=None, is_eval=False):
+        super(Model, self).__init__()
         encoder = Encoder()
-        decoder = Decoder()
+        if config.scratchpad or config.pretrain:
+          decoder = ScratchpadDecoder()
+        else:
+          decoder = Decoder()
+
         reduce_state = ReduceState()
 
         # shared the embedding between encoder and decoder

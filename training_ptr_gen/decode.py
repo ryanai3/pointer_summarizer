@@ -116,13 +116,14 @@ class BeamSearch(object):
         dec_h, dec_c = s_t_0 # 1 x 2*hidden_size
         dec_h = dec_h.squeeze()
         dec_c = dec_c.squeeze()
-
         #decoder batch preparation, it has beam_size example initially everything is repeated
         beams = [Beam(tokens=[self.vocab.word2id(data.START_DECODING)],
                       log_probs=[0.0],
                       state=(dec_h[0], dec_c[0]),
                       context = c_t_0[0],
-                      coverage=(coverage_t_0[0] if config.is_coverage else None))
+                      coverage=(coverage_t_0[0] if config.is_coverage \
+                                else encoder_outputs[0])
+                 )
                  for _ in xrange(config.beam_size)]
         results = []
         steps = 0
@@ -154,10 +155,20 @@ class BeamSearch(object):
                 for h in beams:
                     all_coverage.append(h.coverage)
                 coverage_t_1 = torch.stack(all_coverage, 0)
-
+            elif config.scratchpad:
+                all_enc_o = []
+                for h in beams:
+                  all_enc_o.append(h.coverage)
+                encoder_o_t_1 = torch.stack(all_enc_o, 0)
+            else:
+              pass
+#              raise ValueError("need coverage or scratchpad")
             final_dist, s_t, c_t, attn_dist, p_gen, coverage_t = self.model.decoder(y_t_1, s_t_1,
-                                                        encoder_outputs, encoder_feature, enc_padding_mask, c_t_1,
-                                                        extra_zeros, enc_batch_extend_vocab, coverage_t_1, steps)
+                                                        encoder_o_t_1 if config.scratchpad \
+                                                        else encoder_outputs,
+                                                        encoder_feature,
+                                                        enc_padding_mask, c_t_1, extra_zeros,
+                                                        enc_batch_extend_vocab, coverage_t_1, steps)
 
             topk_log_probs, topk_ids = torch.topk(final_dist, config.beam_size * 2)
 
@@ -171,7 +182,7 @@ class BeamSearch(object):
                 h = beams[i]
                 state_i = (dec_h[i], dec_c[i])
                 context_i = c_t[i]
-                coverage_i = (coverage_t[i] if config.is_coverage else None)
+                coverage_i = (coverage_t[i] if (config.is_coverage or config.scratchpad) else None)
 
                 for j in xrange(config.beam_size * 2):  # for each of the top 2*beam_size hyps:
                     new_beam = h.extend(token=topk_ids[i, j].item(),
